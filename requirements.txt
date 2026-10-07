@@ -1,0 +1,2 @@
+icalendar>=6
+pyobjc-framework-EventKit>=10

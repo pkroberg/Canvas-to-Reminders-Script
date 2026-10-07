@@ -1,0 +1,27 @@
+# Copy to config.toml and fill in. config.toml is gitignored: the feed URL is a private token.
+
+# Canvas → Calendar → "Calendar Feed" (bottom right)
+feed_url = "https://colostate.instructure.com/feeds/calendars/user_XXXXXXXX.ics"
+
+list_name = "Canvas Script"
+
+# Shortcut that creates reminders with a real tag (see README: "Build the Canvas Add Reminder Shortcut").
+# If it's missing, reminders are still created, with "#Tag" in the notes instead.
+shortcut_name = "Canvas Add Reminder"
+use_shortcut = true
+
+# Alert this many minutes before a timed due date (0 = at the due time).
+# All-day items use Reminders' own all-day notification time.
+alert_minutes_before = 0
+
+# On first sight, skip assignments that were due more than this many days ago.
+import_past_days = 1
+
+# When an assignment vanishes from the feed, only add the "removed" note if it
+# was due within this many days (old items age out of the feed normally).
+removed_grace_days = 7
+
+# Course key (DEPT + number, from "[2026FA-CS-356-001]") -> Reminders tag.
+# Unmapped courses use the key itself, e.g. #CS314.
+[course_tags]
+CS356 = "SystemsSecurity"
