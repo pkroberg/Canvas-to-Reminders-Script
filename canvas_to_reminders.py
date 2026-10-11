@@ -33,6 +33,9 @@ LOG_PATH = Path.home() / "Library/Logs/canvas-reminders.log"
 DEFAULT_CONFIG = Path(__file__).resolve().parent / "config.toml"
 
 MARKER_RE = re.compile(r"canvas-assignment-id: (\d+)")
+# Lines older versions wrote into notes; stripped on sync so notes stay clean.
+GENERATED_LINE_RE = re.compile(
+    r"^(https?://\S*instructure\.com/\S*|Course: .*|canvas-assignment-id: \d+)$", re.MULTILINE)
 UID_RE = re.compile(r"^event-assignment-(?:override-)?(\d+)$")
 URL_ID_RE = re.compile(r"#assignment_(\d+)")
 # "2026FA-CS-314-001" -> ("CS", "314")
@@ -110,12 +113,21 @@ def parse_assignments(ics: bytes, course_tags: dict[str, str]) -> list[Assignmen
     return sorted(found.values(), key=lambda a: a.due_dt)
 
 
-def build_notes(a: Assignment, tag_in_notes: bool) -> str:
-    lines = [a.url, "", f"Course: {a.course}"]
-    if tag_in_notes:
-        lines.append(f"#{a.tag}")
-    lines.append(f"canvas-assignment-id: {a.id}")
-    return "\n".join(lines)
+def handoff_notes(a: Assignment) -> str:
+    """Temporary marker so we can find the reminder the Shortcut just made; erased right after."""
+    return f"canvas-assignment-id: {a.id}"
+
+
+def strip_generated(text: str) -> str:
+    text = GENERATED_LINE_RE.sub("", text)
+    return re.sub(r"\n{3,}", "\n\n", text).strip()
+
+
+def due_key(due: str) -> str:
+    """'2026-10-20' or '2026-10-20T23:59-06:00' -> local 'YYYY-MM-DD[THH:MM]'."""
+    if "T" not in due:
+        return due
+    return datetime.fromisoformat(due).astimezone().strftime("%Y-%m-%dT%H:%M")
 
 
 # ----------------------------------------------------------- reminders ----
@@ -125,9 +137,9 @@ class RemindersStore:
 
     def __init__(self, list_name: str, create_list: bool = True):
         import EventKit
-        from Foundation import NSURL, NSDateComponents, NSDate
+        from Foundation import NSDateComponents, NSDate
 
-        self.ek, self.NSURL, self.NSDateComponents, self.NSDate = EventKit, NSURL, NSDateComponents, NSDate
+        self.ek, self.NSDateComponents, self.NSDate = EventKit, NSDateComponents, NSDate
         self.store = EventKit.EKEventStore.alloc().init()
         if not self._wait(self.store.requestFullAccessToRemindersWithCompletion_):
             raise PermissionError(
@@ -179,6 +191,35 @@ class RemindersStore:
                 out[m.group(1)] = r
         return out
 
+    def unclaimed_index(self, claimed_ids: set[str]) -> dict[tuple[str, str], list]:
+        """Reminders not referenced by state, keyed by (title, due key), for lost-state recovery."""
+        out: dict[tuple[str, str], list] = {}
+        for r in self.all_reminders():
+            if r.calendarItemIdentifier() in claimed_ids:
+                continue
+            c = r.dueDateComponents()
+            if c is None:
+                continue
+            key = f"{c.year():04d}-{c.month():02d}-{c.day():02d}"
+            if 0 <= c.hour() <= 23:
+                key += f"T{c.hour():02d}:{c.minute():02d}"
+            out.setdefault((r.title(), key), []).append(r)
+        return out
+
+    @staticmethod
+    def _canvas_url(r) -> bool:
+        return r.URL() is not None and "instructure.com" in str(r.URL().absoluteString())
+
+    def needs_clean(self, r) -> bool:
+        notes = r.notes() or ""
+        return strip_generated(notes) != notes or self._canvas_url(r)
+
+    def clean(self, r) -> None:
+        """Remove generated notes lines (link, course, ID) and the Canvas URL; keep everything else."""
+        r.setNotes_(strip_generated(r.notes() or "") or None)
+        if self._canvas_url(r):
+            r.setURL_(None)
+
     def get(self, reminder_id: str | None):
         if not reminder_id or self.calendar is None:
             return None
@@ -199,12 +240,11 @@ class RemindersStore:
         return c
 
     def apply(self, r, a: Assignment, alert_minutes: int) -> None:
-        """Set title, due date, URL and alarm. Leaves completion state alone."""
+        """Set title, due date and alarm. Leaves completion state alone."""
         r.setTitle_(a.title)
         r.setDueDateComponents_(self._components(a))
         r.setStartDateComponents_(None)
-        if a.url:
-            r.setURL_(self.NSURL.URLWithString_(a.url))
+        r.setURL_(None)
         if a.all_day:
             r.setAlarms_(None)  # Reminders' own all-day notification time applies
         else:
@@ -296,6 +336,24 @@ def sync(assignments: list[Assignment], state: dict, store: RemindersStore | Non
         log.warning("Shortcut %r not found; new reminders get their tag in the notes instead.", shortcut)
 
     markers = store.by_marker() if store else {}
+    claimed = {e.get("reminder_id") for e in state.values() if e.get("reminder_id")}
+    unclaimed = store.unclaimed_index(claimed) if store else {}
+
+    def match_unclaimed(title: str, due: str):
+        candidates = unclaimed.get((title, due_key(due)))
+        return candidates.pop(0) if candidates else None
+
+    # Strip the link / course / ID lines older versions wrote into notes.
+    if store:
+        # Skip unlinked handoff leftovers: their marker is how this run relinks them.
+        to_clean = [r for r in store.all_reminders() if store.needs_clean(r)
+                    and (r.calendarItemIdentifier() in claimed or not MARKER_RE.search(r.notes() or ""))]
+        if to_clean:
+            log.info("%s %d reminders (old link/course/ID notes)", "WOULD CLEAN" if dry_run else "CLEANED", len(to_clean))
+            if not dry_run:
+                for r in to_clean:
+                    store.clean(r)
+                    store.save(r)
     # If the whole list was deleted and recreated, start fresh instead of treating
     # every reminder as individually deleted.
     if store and store.list_created:
@@ -313,6 +371,13 @@ def sync(assignments: list[Assignment], state: dict, store: RemindersStore | Non
         r = None
         if store:
             r = store.get(entry.get("reminder_id") if entry else None) or markers.get(a.id)
+            if r is None and entry and entry.get("reminder_id"):
+                # Identifier may have changed (e.g. iCloud re-sync): look for it by last-known title/due.
+                r = match_unclaimed(entry.get("title", ""), entry.get("due", ""))
+                if r is not None:
+                    entry["reminder_id"] = r.calendarItemIdentifier()
+            elif r is None and not entry:
+                r = match_unclaimed(a.title, a.due)
 
         if r is None and entry and entry.get("reminder_id") and store:
             log.info("User deleted reminder for %r; not recreating", a.title)
@@ -328,9 +393,8 @@ def sync(assignments: list[Assignment], state: dict, store: RemindersStore | Non
             stats["created"] += 1
             if dry_run:
                 continue
-            notes = build_notes(a, tag_in_notes=not use_shortcut)
             r = None
-            if use_shortcut and create_via_shortcut(shortcut, list_name, a, notes):
+            if use_shortcut and create_via_shortcut(shortcut, list_name, a, handoff_notes(a)):
                 r = store.wait_for_marker(a.id)
                 if r is None:
                     # It may still show up; creating another now could duplicate it.
@@ -338,18 +402,20 @@ def sync(assignments: list[Assignment], state: dict, store: RemindersStore | Non
                     log.warning("Shortcut ran but reminder for %s not visible yet; retrying next run", a.id)
                     stats["created"] -= 1
                     continue
+                store.clean(r)
                 store.apply(r, a, alert)
                 store.save(r)
             else:
-                r = store.create(a, build_notes(a, tag_in_notes=True), alert)
+                r = store.create(a, f"#{a.tag}", alert)  # no Shortcut: the notes are the only place for the tag
             state[a.id] = _entry(a, r, today)
             continue
 
         if r is not None and not entry:
-            # State was lost but the reminder carries its marker: adopt it.
+            # State was lost (or a handoff was interrupted): adopt the existing reminder.
             log.info("RELINK  %-12s %s", f"#{a.tag}", a.title)
             stats["relinked"] += 1
             if not dry_run:
+                store.clean(r)
                 store.apply(r, a, alert)
                 store.save(r)
                 state[a.id] = _entry(a, r, today)

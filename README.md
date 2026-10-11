@@ -51,7 +51,7 @@ Open `config.toml` and set:
 Apple doesn't let scripts set Reminders **tags**: EventKit and AppleScript have no API for them,
 and `#Tag` typed into a title by a script stays plain text. The Shortcuts action
 **Add New Reminder** can set tags, so the script creates each reminder through a Shortcut. It then
-sets the due date, link and alert itself. Later edits keep the tag.
+sets the due date and alert itself. Later edits keep the tag.
 
 The Tags field won't accept a variable, so the Shortcut has **one If branch per tag**, with each tag typed in by hand.
 
@@ -136,9 +136,13 @@ tail -f ~/Library/Logs/canvas-reminders.log            # watch syncs
   holidays and demo days, are skipped.
 - **Times:** due times are converted to your local time zone. Canvas exports 11:59 PM deadlines as date-only,
   so those become all-day reminders.
+- **Clean reminders:** each one has only a title, a tag and a due date. The script leaves the notes and URL
+  empty, and never touches anything you type into the notes yourself.
 - **State:** `~/Library/Application Support/CanvasReminders/state.json` maps each Canvas ID to a reminder.
-  Each reminder's notes also include `canvas-assignment-id: N`. If the state file is lost, the next run
-  relinks existing reminders instead of creating duplicates.
+  The Shortcut writes `canvas-assignment-id: N` into the notes so the script can find the new reminder;
+  the script erases it a second later. If the state file is lost, the next run relinks existing reminders
+  by **title + due date** instead of creating duplicates. One exception: if an assignment was renamed or
+  re-dated in Canvas at the same time the state was lost, that single assignment gets a duplicate.
 - **Why the `.app` wrapper:** macOS only gives Reminders access to an app with a usage description. A bare
   `python` binary can't show the permission prompt. `install.sh` generates an ad-hoc-signed
   bundle, and `run.sh` and launchd both run the script through it.
